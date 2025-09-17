@@ -2,91 +2,102 @@ CREATE OR REPLACE PROCEDURE IDENTIFY_HASH_COLUMNS(
     DB_NAME STRING,
     SCHEMA_NAME STRING,
     TABLE_NAME STRING,
-    SAMPLE_PCT FLOAT DEFAULT 0.02,        -- % of rows to sample
-    UNIQUENESS_THRESHOLD FLOAT DEFAULT 0.9999, -- stop when ~99.99% unique
-    CONFIG_TABLE STRING DEFAULT 'EXPORT_KEYS'  -- where to persist chosen cols
+    SAMPLE_PCT FLOAT DEFAULT 0.02,
+    UNIQUENESS_THRESHOLD FLOAT DEFAULT 0.9999,
+    CONFIG_TABLE STRING DEFAULT 'EXPORT_KEYS'
 )
 RETURNS STRING
 LANGUAGE PYTHON
-RUNTIME_VERSION = '3.9'
+RUNTIME_VERSION = '3.10'
 PACKAGES = ('snowflake-snowpark-python')
 AS
 $$
-from snowflake.snowpark.functions import col, approx_count_distinct, avg, iff, lit, hash
+from snowflake.snowpark import Session
 import json
 
-def run(session, db_name, schema_name, table_name, sample_pct, uniqueness_threshold, config_table):
+def run(session: Session, DB_NAME, SCHEMA_NAME, TABLE_NAME,
+        SAMPLE_PCT, UNIQUENESS_THRESHOLD, CONFIG_TABLE):
 
-    fq_table = f'"{db_name}"."{schema_name}"."{table_name}"'
-    fq_config = f'"{db_name}"."{schema_name}"."{config_table}"'
+    # Normalize for INFORMATION_SCHEMA; keep originals for quoted identifiers
+    db = DB_NAME.strip().strip('"')
+    sch = SCHEMA_NAME.strip().strip('"')
+    tab = TABLE_NAME.strip().strip('"')
+    db_u, sch_u, tab_u = db.upper(), sch.upper(), tab.upper()
 
-    # 1. total rows
-    total_rows = session.sql(f"SELECT COUNT(*) AS c FROM {fq_table}").collect()[0]["C"]
+    fq_tbl = f'"{db}"."{sch}"."{tab}"'
+    fq_cfg = f'"{db}"."{sch}"."{CONFIG_TABLE}"'
 
-    # 2. fetch column list
-    cols = session.sql(f"""
+    # 0) Fetch column list (UPPERCASE filters)
+    cols_df = session.sql(f"""
         SELECT COLUMN_NAME, ORDINAL_POSITION
-        FROM {db_name}.INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = '{schema_name}' AND TABLE_NAME = '{table_name}'
+        FROM {db_u}.INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = '{sch_u}'
+          AND TABLE_NAME   = '{tab_u}'
         ORDER BY ORDINAL_POSITION
     """).collect()
-    col_names = [r["COLUMN_NAME"] for r in cols]
 
-    # 3. profile columns (on sample)
+    if not cols_df:
+        return (f"No columns found via INFORMATION_SCHEMA for {db}.{sch}.{tab}. "
+                f"Check name/case; expected TABLE_SCHEMA='{sch_u}', TABLE_NAME='{tab_u}'.")
+
+    col_names = [r["COLUMN_NAME"] for r in cols_df]
+
+    # 1) Total rows
+    total_rows = session.sql(f"SELECT COUNT(*) AS C FROM {fq_tbl}").collect()[0]["C"]
+    if total_rows == 0:
+        return f"Table {fq_tbl} is empty; nothing to infer."
+
+    # 2) Profile each column on a SAMPLE (approx NDV + null rate)
     stats = []
     for c in col_names:
-        q = f"""
-          SELECT
-            APPROX_COUNT_DISTINCT("{c}") AS ndv,
-            AVG(IFF("{c}" IS NULL,1,0))  AS null_rate
-          FROM {fq_table} SAMPLE ({sample_pct*100} PERCENT)
-        """
-        row = session.sql(q).collect()[0]
-        stats.append({
-            "col": c,
-            "ndv": row["NDV"],
-            "null_rate": row["NULL_RATE"],
-            "ratio": row["NDV"]/total_rows
-        })
+        prof = session.sql(f"""
+            SELECT
+              APPROX_COUNT_DISTINCT("{c}") AS NDV,
+              AVG(IFF("{c}" IS NULL, 1, 0)) AS NULL_RATE
+            FROM {fq_tbl} SAMPLE ({SAMPLE_PCT*100} PERCENT)
+        """).collect()[0]
+        ndv = prof["NDV"] or 0
+        null_rate = float(prof["NULL_RATE"] or 0.0)
+        ratio = (ndv / total_rows) if total_rows else 0.0
+        stats.append({"col": c, "ndv": ndv, "null_rate": null_rate, "ratio": ratio})
 
-    # 4. rank columns: high cardinality, low nulls
+    # 3) Rank: high cardinality, low nulls
     ranked = sorted(stats, key=lambda r: (-r["ratio"], r["null_rate"]))
 
-    # 5. greedy selection
+    # 4) Greedy selection with full-table DISTINCT verification
     selected = []
     distinct_rows = 0
     for r in ranked:
         selected.append(r["col"])
         obj_pairs = ", ".join([f"'{c}', \"{c}\"" for c in selected])
-        check_sql = f"""
-          SELECT COUNT(DISTINCT HASH(OBJECT_CONSTRUCT_KEEP_NULL({obj_pairs}))) AS d
-          FROM {fq_table}
-        """
-        distinct_rows = session.sql(check_sql).collect()[0]["D"]
-        if distinct_rows/total_rows >= uniqueness_threshold:
+        chk = session.sql(f"""
+            SELECT COUNT(DISTINCT HASH(OBJECT_CONSTRUCT_KEEP_NULL({obj_pairs}))) AS D
+            FROM {fq_tbl}
+        """).collect()[0]
+        distinct_rows = int(chk["D"])
+        if distinct_rows / total_rows >= float(UNIQUENESS_THRESHOLD):
             break
 
-    # 6. persist result into config table
+    # Safety: if nothing reached the threshold, still persist the best-so-far
+    # (could be empty if INFORMATION_SCHEMA was empty, but we guarded above)
     session.sql(f"""
-      CREATE TABLE IF NOT EXISTS {fq_config} (
+      CREATE TABLE IF NOT EXISTS {fq_cfg} (
         DB_NAME STRING, SCHEMA_NAME STRING, TABLE_NAME STRING,
         KEY_COLS ARRAY, TOTAL_ROWS NUMBER, DISTINCT_ROWS NUMBER, AS_OF TIMESTAMP_LTZ
       )
     """).collect()
 
-    ins = f"""
-      INSERT INTO {fq_config}
-      SELECT '{db_name}','{schema_name}','{table_name}',
+    session.sql(f"""
+      INSERT INTO {fq_cfg}
+      SELECT '{db}','{sch}','{tab}',
              PARSE_JSON('{json.dumps(selected)}'),
              {total_rows},{distinct_rows},CURRENT_TIMESTAMP()
-    """
-    session.sql(ins).collect()
-    return f"Selected key columns for {fq_table}: {selected}, uniqueness={distinct_rows/total_rows:.6f}"
+    """).collect()
 
+    if not selected:
+        return (f"Could not reach uniqueness threshold; persisted empty KEY_COLS. "
+                f"Check sampling percent or data quality.")
+
+    return (f"Selected KEY_COLS={selected}; uniqueness={distinct_rows/total_rows:.6f} "
+            f"for {fq_tbl} (sample={SAMPLE_PCT*100:.2f}%).")
 $$;
-
-
-
-
-DB_NAME	SCHEMA_NAME	TABLE_NAME	KEY_COLS	TOTAL_ROWS	DISTINCT_ROWS	AS_OF
-CUR_BDA	VIVID	ENIGMA_BIN_MERCHANT_DATA_MTHLY_Test3	[]	477789960	0	2025-09-17 02:23:25.168 -0700
