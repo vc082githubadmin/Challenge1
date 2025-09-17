@@ -81,7 +81,12 @@ def run(session, db_name, schema_name, table_name, sample_pct, uniqueness_thresh
              {total_rows},{distinct_rows},CURRENT_TIMESTAMP()
     """
     session.sql(ins).collect()
-
     return f"Selected key columns for {fq_table}: {selected}, uniqueness={distinct_rows/total_rows:.6f}"
 
 $$;
+
+
+
+
+DB_NAME	SCHEMA_NAME	TABLE_NAME	KEY_COLS	TOTAL_ROWS	DISTINCT_ROWS	AS_OF
+CUR_BDA	VIVID	ENIGMA_BIN_MERCHANT_DATA_MTHLY_Test3	[]	477789960	0	2025-09-17 02:23:25.168 -0700
