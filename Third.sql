@@ -26,3 +26,15 @@ ORDER BY 1;
 SELECT COUNT(*) AS total_rows,
        COUNT(DISTINCT REC_FP) AS distinct_row_fps   -- if you plan to dedupe exact duplicates
 FROM V_<TAB>_WITH_FP;
+-------
+WITH s AS (
+  SELECT CONV(HASH_SHA2(OBJECT_CONSTRUCT_KEEP_NULL(
+           'col1', col1, 'col2', col2, ...), 256), 16, 10) AS rec_fp
+  FROM DB.SCHEMA.TABLE
+)
+SELECT $N_SHARDS  AS n_shards,
+       $SHARD_ID  AS shard_id,
+       COUNT(*)   AS rows_in_shard
+FROM s
+WHERE MOD(rec_fp, $N_SHARDS) = $SHARD_ID;
+
